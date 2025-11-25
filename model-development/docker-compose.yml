@@ -1,0 +1,132 @@
+# Docker Compose for Lab Lens Model Development
+# Author: Lab Lens Team
+# Description: Orchestrates model development services
+# Required by Rubric: Section 8 - Docker Implementation
+#
+# This docker-compose file:
+# - Sets up complete model development environment
+# - Links data pipeline outputs to model training
+# - Configures MLflow server for experiment tracking
+# - Mounts local directories for persistence
+# - Supports team collaboration
+
+version: '3.8'
+
+services:
+  # ==========================================================================
+  # Model Training Service
+  # ==========================================================================
+  model-training:
+    build:
+      context: .
+      dockerfile: model-development/Dockerfile
+    container_name: lab-lens-training
+    volumes:
+      # Mount data directories
+      - ./data-pipeline/data:/app/data-pipeline/data:ro  # Read-only data
+      - ./model-development/data:/app/model-development/data
+      
+      # Mount model directories
+      - ./model-development/models:/app/model-development/models
+      - ./model-development/logs:/app/model-development/logs
+      
+      # Mount configs (allows editing without rebuild)
+      - ./model-development/configs:/app/model-development/configs
+      
+      # Mount scripts (for development)
+      - ./model-development/scripts:/app/model-development/scripts
+      
+      # Mount reports
+      - ./model-development/validation_reports:/app/model-development/validation_reports
+      - ./model-development/bias_reports:/app/model-development/bias_reports
+      - ./model-development/sensitivity_reports:/app/model-development/sensitivity_reports
+      - ./model-development/model_registry:/app/model-development/model_registry
+    
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TOKENIZERS_PARALLELISM=false
+      - MLFLOW_TRACKING_URI=file:///app/model-development/logs/mlruns
+    
+    command: python model-development/scripts/train_biobart.py --config model-development/configs/model_config.json
+    
+    # Resource limits (adjust based on your system)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+
+  # ==========================================================================
+  # MLflow Tracking Server
+  # ==========================================================================
+  mlflow:
+    build:
+      context: .
+      dockerfile: model-development/Dockerfile
+    container_name: lab-lens-mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./model-development/logs/mlruns:/app/mlruns
+    command: mlflow ui --host 0.0.0.0 --backend-store-uri /app/mlruns
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=/app/mlruns
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================================================
+  # Model Validation Service
+  # ==========================================================================
+  validation:
+    build:
+      context: .
+      dockerfile: model-development/Dockerfile
+    container_name: lab-lens-validation
+    volumes:
+      - ./model-development/data:/app/model-development/data:ro
+      - ./model-development/models:/app/model-development/models:ro
+      - ./model-development/configs:/app/model-development/configs:ro
+      - ./model-development/validation_reports:/app/model-development/validation_reports
+    command: python model-development/scripts/validate_model.py
+    depends_on:
+      - model-training
+    profiles:
+      - validation  # Only run when explicitly requested
+
+  # ==========================================================================
+  # Bias Detection Service
+  # ==========================================================================
+  bias-detection:
+    build:
+      context: .
+      dockerfile: model-development/Dockerfile
+    container_name: lab-lens-bias-detection
+    volumes:
+      - ./model-development/data:/app/model-development/data:ro
+      - ./model-development/models:/app/model-development/models:ro
+      - ./model-development/configs:/app/model-development/configs:ro
+      - ./model-development/bias_reports:/app/model-development/bias_reports
+    command: python model-development/scripts/bias_detection_model.py
+    depends_on:
+      - model-training
+    profiles:
+      - validation  # Only run when explicitly requested
+
+# ==========================================================================
+# Named volumes for data persistence
+# ==========================================================================
+volumes:
+  mlflow-data:
+    driver: local
+
+# ==========================================================================
+# Network configuration
+# ==========================================================================
+networks:
+  default:
+    name: lab-lens-network

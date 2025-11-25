@@ -257,3 +257,14 @@ airflow/airflow.db
 airflow/airflow-webserver.pid
 airflow/logs/
 airflow/airflow.cfg
+# Model Development - Exclude large files
+model-development/models/*.bin
+model-development/models/*.safetensors
+model-development/hyperparameter_tuning/mlruns/
+model-development/hyperparameter_tuning/exp_*/
+model-development/logs/
+venv/
+venv311/
+*.pyc
+__pycache__/
+.DS_Store

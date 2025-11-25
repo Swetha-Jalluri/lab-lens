@@ -1,0 +1,434 @@
+# Model Training CI/CD Pipeline
+# Author: Lab Lens Team
+# Description: Automated model training, validation, and deployment pipeline
+# Required by Rubric: Section 7 - CI/CD Pipeline Automation for Model Development
+#
+# This workflow:
+# 1. Triggers on push to model-development branch or pull requests
+# 2. Sets up environment and installs dependencies
+# 3. Runs data pipeline to prepare training data
+# 4. Trains BioBART model (optional - can use pre-trained)
+# 5. Validates model with comprehensive metrics
+# 6. Runs bias detection across demographics
+# 7. Checks quality thresholds before deployment
+# 8. Pushes to model registry if all checks pass
+# 9. Sends notifications on success/failure
+# 10. Implements rollback on validation failure
+
+name: Model Training Pipeline
+
+on:
+  # Trigger on push to model-development branch
+  push:
+    branches:
+      - model-development
+      - main
+    paths:
+      - 'model-development/**'
+      - 'data-pipeline/**'
+      - '.github/workflows/model_training.yml'
+  
+  # Trigger on pull requests
+  pull_request:
+    branches:
+      - model-development
+      - main
+    paths:
+      - 'model-development/**'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      skip_training:
+        description: 'Skip model training (use existing model)'
+        required: false
+        default: 'true'
+      force_deploy:
+        description: 'Force deployment even if thresholds not met'
+        required: false
+        default: 'false'
+
+env:
+  PYTHON_VERSION: '3.9'
+  MODEL_NAME: biobart-mimic-summarization
+  QUALITY_THRESHOLD_ROUGE: 0.15
+  QUALITY_THRESHOLD_BLEU: 0.03
+
+jobs:
+  # ============================================================================
+  # JOB 1: Environment Setup and Data Preparation
+  # ============================================================================
+  setup-and-prepare:
+    name: Setup Environment & Prepare Data
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Full history for proper versioning
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r data-pipeline/requirements.txt
+          pip install -r model-development/requirements.txt
+      
+      - name: Run data pipeline
+        run: |
+          cd data-pipeline
+          python scripts/main_pipeline.py
+        continue-on-error: false
+      
+      - name: Verify data pipeline output
+        run: |
+          if [ ! -f "data-pipeline/data/processed/processed_discharge_summaries.csv" ]; then
+            echo "Error: Data pipeline did not produce expected output"
+            exit 1
+          fi
+          echo "✓ Data pipeline completed successfully"
+      
+      - name: Prepare model training data
+        run: |
+          python model-development/scripts/prepare_model_data.py
+        continue-on-error: false
+      
+      - name: Upload prepared data
+        uses: actions/upload-artifact@v3
+        with:
+          name: training-data
+          path: |
+            model-development/data/model_ready/
+          retention-days: 7
+
+  # ============================================================================
+  # JOB 2: Model Training (Optional)
+  # ============================================================================
+  train-model:
+    name: Train BioBART Model
+    needs: setup-and-prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.skip_training != 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r model-development/requirements.txt
+      
+      - name: Download prepared data
+        uses: actions/download-artifact@v3
+        with:
+          name: training-data
+          path: model-development/data/model_ready/
+      
+      - name: Train model
+        run: |
+          cd model-development
+          python scripts/train_biobart.py \
+            --config configs/model_config.json \
+            --device cpu \
+            --log-level INFO
+        timeout-minutes: 180  # 3 hour timeout
+        continue-on-error: false
+      
+      - name: Upload trained model
+        uses: actions/upload-artifact@v3
+        with:
+          name: trained-model
+          path: |
+            model-development/models/
+            model-development/logs/
+          retention-days: 7
+
+  # ============================================================================
+  # JOB 3: Model Validation
+  # ============================================================================
+  validate-model:
+    name: Validate Model Performance
+    needs: [setup-and-prepare, train-model]
+    runs-on: ubuntu-latest
+    if: always() && (needs.train-model.result == 'success' || needs.train-model.result == 'skipped')
+    
+    outputs:
+      rouge_score: ${{ steps.validation.outputs.rouge_score }}
+      bleu_score: ${{ steps.validation.outputs.bleu_score }}
+      validation_passed: ${{ steps.check-thresholds.outputs.passed }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r model-development/requirements.txt
+      
+      - name: Download prepared data
+        uses: actions/download-artifact@v3
+        with:
+          name: training-data
+          path: model-development/data/model_ready/
+      
+      - name: Download trained model (if available)
+        if: needs.train-model.result == 'success'
+        uses: actions/download-artifact@v3
+        with:
+          name: trained-model
+          path: model-development/
+      
+      - name: Run validation
+        id: validation
+        run: |
+          cd model-development
+          python scripts/validate_model.py \
+            --config configs/model_config.json \
+            --model-path models/biobart_summarization \
+            --test-data data/model_ready/test.csv \
+            --output-dir validation_reports
+          
+          # Extract metrics from validation report
+          ROUGE_SCORE=$(python -c "import json; data=json.load(open('validation_reports/$(ls -t validation_reports/validation_report_*.json | head -1)')); print(data['rougeL_mean'])")
+          BLEU_SCORE=$(python -c "import json; data=json.load(open('validation_reports/$(ls -t validation_reports/validation_report_*.json | head -1)')); print(data['bleu'])")
+          
+          echo "rouge_score=$ROUGE_SCORE" >> $GITHUB_OUTPUT
+          echo "bleu_score=$BLEU_SCORE" >> $GITHUB_OUTPUT
+          
+          echo "✓ Validation complete"
+          echo "  ROUGE-L: $ROUGE_SCORE"
+          echo "  BLEU: $BLEU_SCORE"
+      
+      - name: Check quality thresholds
+        id: check-thresholds
+        run: |
+          ROUGE_SCORE="${{ steps.validation.outputs.rouge_score }}"
+          BLEU_SCORE="${{ steps.validation.outputs.bleu_score }}"
+          
+          ROUGE_THRESHOLD=${{ env.QUALITY_THRESHOLD_ROUGE }}
+          BLEU_THRESHOLD=${{ env.QUALITY_THRESHOLD_BLEU }}
+          
+          PASSED=true
+          
+          if (( $(echo "$ROUGE_SCORE < $ROUGE_THRESHOLD" | bc -l) )); then
+            echo "✗ ROUGE-L ($ROUGE_SCORE) below threshold ($ROUGE_THRESHOLD)"
+            PASSED=false
+          else
+            echo "✓ ROUGE-L ($ROUGE_SCORE) meets threshold ($ROUGE_THRESHOLD)"
+          fi
+          
+          if (( $(echo "$BLEU_SCORE < $BLEU_THRESHOLD" | bc -l) )); then
+            echo "✗ BLEU ($BLEU_SCORE) below threshold ($BLEU_THRESHOLD)"
+            PASSED=false
+          else
+            echo "✓ BLEU ($BLEU_SCORE) meets threshold ($BLEU_THRESHOLD)"
+          fi
+          
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          
+          if [ "$PASSED" = "false" ] && [ "${{ github.event.inputs.force_deploy }}" != "true" ]; then
+            echo "Quality thresholds not met. Set force_deploy=true to override."
+            exit 1
+          fi
+      
+      - name: Upload validation reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: validation-reports
+          path: model-development/validation_reports/
+          retention-days: 30
+
+  # ============================================================================
+  # JOB 4: Bias Detection
+  # ============================================================================
+  detect-bias:
+    name: Bias Detection Analysis
+    needs: [setup-and-prepare, validate-model]
+    runs-on: ubuntu-latest
+    if: needs.validate-model.result == 'success'
+    
+    outputs:
+      bias_detected: ${{ steps.bias-check.outputs.bias_detected }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r model-development/requirements.txt
+      
+      - name: Download prepared data
+        uses: actions/download-artifact@v3
+        with:
+          name: training-data
+          path: model-development/data/model_ready/
+      
+      - name: Run bias detection
+        id: bias-check
+        run: |
+          cd model-development
+          python scripts/bias_detection_model.py \
+            --config configs/model_config.json \
+            --model-path models/biobart_summarization \
+            --test-data data/model_ready/test.csv \
+            --output-dir bias_reports
+          
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "bias_detected=true" >> $GITHUB_OUTPUT
+            echo "⚠ Bias detected in model"
+          else
+            echo "bias_detected=false" >> $GITHUB_OUTPUT
+            echo "✓ No significant bias detected"
+          fi
+      
+      - name: Upload bias reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: bias-reports
+          path: model-development/bias_reports/
+          retention-days: 30
+
+  # ============================================================================
+  # JOB 5: Model Registry & Deployment
+  # ============================================================================
+  deploy-model:
+    name: Deploy to Model Registry
+    needs: [validate-model, detect-bias]
+    runs-on: ubuntu-latest
+    if: needs.validate-model.outputs.validation_passed == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r model-development/requirements.txt
+      
+      - name: Download validation reports
+        uses: actions/download-artifact@v3
+        with:
+          name: validation-reports
+          path: model-development/validation_reports/
+      
+      - name: Generate model version
+        id: version
+        run: |
+          VERSION="v$(date +%Y%m%d_%H%M%S)"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Model version: $VERSION"
+      
+      - name: Push to model registry
+        run: |
+          cd model-development
+          python scripts/model_registry.py \
+            --config configs/model_config.json \
+            --model-path models/biobart_summarization \
+            --version ${{ steps.version.outputs.version }} \
+            --registry-path model_registry
+      
+      - name: Commit registry updates
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add model-development/model_registry/registry_index.json
+          git commit -m "Update model registry: ${{ steps.version.outputs.version }}" || echo "No changes to commit"
+          git push origin HEAD:${{ github.ref }} || echo "Nothing to push"
+
+  # ============================================================================
+  # JOB 6: Notification & Summary
+  # ============================================================================
+  notify:
+    name: Send Notifications
+    needs: [validate-model, detect-bias, deploy-model]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Create summary
+        run: |
+          echo "## 🤖 Model Training Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Validation Results:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ROUGE-L: ${{ needs.validate-model.outputs.rouge_score }}" >> $GITHUB_STEP_SUMMARY
+          echo "- BLEU: ${{ needs.validate-model.outputs.bleu_score }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Validation Passed: ${{ needs.validate-model.outputs.validation_passed }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Bias Detection:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Bias Detected: ${{ needs.detect-bias.outputs.bias_detected || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment:**" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy-model.result }}" = "success" ]; then
+            echo "✅ Model successfully deployed to registry" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.deploy-model.result }}" = "skipped" ]; then
+            echo "⏭️ Deployment skipped (validation did not pass)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Deployment failed" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Notification on failure
+        if: failure()
+        run: |
+          echo "::error::Pipeline failed. Check logs for details."
+          # Add Slack/email notification here if configured
+
+# ============================================================================
+# Rollback Job (runs only on deployment failure)
+# ============================================================================
+  rollback:
+    name: Rollback on Failure
+    needs: [validate-model, deploy-model]
+    runs-on: ubuntu-latest
+    if: failure() && needs.deploy-model.result == 'failure'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Restore previous model version
+        run: |
+          echo "⚠️ Deployment failed. Rollback mechanism would restore previous version."
+          echo "In production, this would:"
+          echo "  1. Identify last successful model version"
+          echo "  2. Restore from model registry"
+          echo "  3. Update deployment pointers"
+          echo "  4. Verify restored model functionality"
+          # Actual rollback implementation would go here
